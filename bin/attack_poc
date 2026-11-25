@@ -1,0 +1,138 @@
+<?php
+
+declare(strict_types=1);
+
+/**
+ * End-to-end proof of the original attack chain being blocked.
+ *
+ * Scenario from the incident report:
+ *   1. attacker puts CRLF + extra recipients/body into the email field
+ *   2. attacker abuses sendmail additional parameters to write a "log"
+ *      (webshell) under the web root
+ *
+ * Run: php bin/attack_poc
+ */
+
+require __DIR__ . '/../vendor/autoload.php';
+
+use MailGuard\EmailAddress;
+use MailGuard\Message;
+use MailGuard\NativeMailer;
+use MailGuard\ValidationException;
+use MailGuard\ValidationOptions;
+
+$failures = 0;
+$check = static function (string $label, bool $ok) use (&$failures): void {
+    echo ($ok ? '[BLOCKED] ' : '[VULNERABLE] ') . $label . "\n";
+    if (!$ok) {
+        $failures++;
+    }
+};
+
+// A recording stub standing in for PHP mail(): captures exactly what would
+// have reached the sendmail command line.
+$captured = [];
+$stubMail = static function (string $to, string $subject, string $body, string $headers, ?string $params) use (&$captured): bool {
+    $captured[] = compact('to', 'subject', 'body', 'headers', 'params');
+    return true;
+};
+
+echo "=== Attack 1: CRLF header injection via the email field ===\n";
+
+$maliciousEmail = "victim@example.com\r\nBcc: spam1@evil.example,spam2@evil.example\r\nContent-Type: text/html\r\n\r\n<script>steal()</script>";
+
+try {
+    EmailAddress::fromUserInput($maliciousEmail);
+    $check('CRLF in address field rejected', false);
+} catch (ValidationException $e) {
+    $check('CRLF in address field rejected', true);
+    echo '          reason: ' . $e->getMessage() . "\n";
+}
+
+// Same trick through the display-name half of "Name <addr>".
+try {
+    EmailAddress::fromUserInput("Attacker <x@example.com>\r\nBcc: spam@evil.example");
+    $check('CRLF smuggled via angle-addr display name rejected', false);
+} catch (ValidationException) {
+    $check('CRLF smuggled via angle-addr display name rejected', true);
+}
+
+// Encoded newlines (common when the framework URL-decodes before validation).
+try {
+    EmailAddress::fromUserInput("x@example.com%0d%0aBcc:%20spam@evil.example");
+    $check('Encoded %0d%0a payload rejected (not a valid addr-spec)', false);
+} catch (ValidationException) {
+    $check('Encoded %0d%0a payload rejected (not a valid addr-spec)', true);
+}
+
+echo "\n=== Attack 2: sendmail parameter injection / log-to-webshell ===\n";
+
+// The historical payload: fifth arg like
+//   -X/var/www/html/shell.php -fwww@victim
+// or sender field  attacker@x -oQ/tmp -X/var/www/html/shell.php
+foreach ([
+    '-X/var/www/html/shell.php -fwww@victim',
+    'attacker@x -oQ/tmp -X/var/www/html/shell.php',
+] as $attempt) {
+    try {
+        EmailAddress::fromUserInput($attempt);
+        $check("parameter payload rejected: {$attempt}", false);
+    } catch (ValidationException) {
+        $check("parameter payload rejected: {$attempt}", true);
+    }
+}
+
+// NativeMailer offers NO API for user-controlled additional parameters;
+// its only -f value is a fixed validated config address.
+$fixedSender = EmailAddress::fromUserInput('bounces@example.com');
+$mailer = new NativeMailer($fixedSender, null, $stubMail);
+
+$message = Message::create()
+    ->from(EmailAddress::fromUserInput('noreply@example.com', 'Example'))
+    ->to(EmailAddress::fromUserInput('real-user@example.com'))
+    ->subject('Password reset')
+    ->text('Reset link: https://example.com/reset?token=secret');
+
+$mailer->send($message);
+
+$onlyParams = $captured[0]['params'] ?? null;
+$check('only additional parameter ever emitted is the fixed -f sender', $onlyParams === '-fbounces@example.com');
+$check('no -X (log file) flag can reach sendmail', !str_contains((string)$onlyParams, '-X'));
+$check('no -oQ (queue dir) flag can reach sendmail', !str_contains((string)$onlyParams, '-oQ'));
+$check('rendered headers contain no Bcc injection', !str_contains($captured[0]['headers'], 'evil.example'));
+
+echo "\n=== Legitimate traffic still works ===\n";
+
+$legit = [
+    'jane.doe+news@sub.example.co.uk',
+    'user@例え.jp',                 // internationalised domain
+    'info@müller.example',
+    '用户@example.com',             // SMTPUTF8-capable local part (opt-in)
+];
+
+$options = (new ValidationOptions())->withUnicodeLocalPart(true);
+foreach ($legit as $addr) {
+    try {
+        $valid = EmailAddress::fromUserInput($addr, null, $options);
+        echo "[OK] {$addr} -> {$valid->address}\n";
+    } catch (ValidationException $e) {
+        $check("legit address accepted: {$addr}", false);
+        echo '          ' . $e->getMessage() . "\n";
+    }
+}
+
+// A full legit message renders and "sends" through the stub.
+$captured = [];
+$mailer->send(
+    Message::create()
+        ->from(EmailAddress::fromUserInput('noreply@example.com', '我的站点'))
+        ->to(EmailAddress::fromUserInput('user@例え.jp', 'ユーザー'))
+        ->subject('重置密码')
+        ->html('<p>点击重置</p>')
+        ->text('点击重置'),
+);
+$check('internationalised message delivered to puny-coded envelope', $captured[0]['to'] === 'user@xn--r8jz45g.jp');
+$check('unicode subject MIME-encoded (no raw multibyte in header)', str_starts_with($captured[0]['subject'], '=?UTF-8?B?'));
+
+echo "\n" . ($failures === 0 ? "ALL ATTACKS BLOCKED, LEGIT MAIL FLOWS NORMAL\n" : "{$failures} CHECK(S) FAILED\n");
+exit($failures === 0 ? 0 : 1);

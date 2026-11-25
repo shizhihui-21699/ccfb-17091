@@ -1,0 +1,29 @@
+{
+    "name": "mailguard/mailguard",
+    "description": "Hardened email address/header validation and safe mailer adapters (anti header-injection / parameter-injection)",
+    "type": "library",
+    "license": "MIT",
+    "require": {
+        "php": ">=8.2",
+        "ext-intl": "*",
+        "ext-mbstring": "*",
+        "phpmailer/phpmailer": "^7.2",
+        "symfony/mailer": "^8.1"
+    },
+    "require-dev": {
+        "phpunit/phpunit": "^13.4"
+    },
+    "autoload": {
+        "psr-4": {
+            "MailGuard\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "MailGuardTests\\": "tests/"
+        }
+    },
+    "scripts": {
+        "test": "phpunit"
+    }
+}
