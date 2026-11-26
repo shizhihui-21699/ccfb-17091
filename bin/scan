@@ -1,0 +1,93 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+/**
+ * MailGuard sink scanner — enumerate every mail-sending / header-building
+ * location in a PHP project and rank injection risks.
+ *
+ * Usage:
+ *   bin/scan [--format=text|json] [--exclude=dir1,dir2] <path...>
+ *
+ * Exit code: 1 if any CRITICAL finding, otherwise 0 (usable in CI).
+ */
+
+$autoload = [
+    __DIR__ . '/../vendor/autoload.php',
+    __DIR__ . '/../../../autoload.php',
+];
+foreach ($autoload as $candidate) {
+    if (is_file($candidate)) {
+        require $candidate;
+        break;
+    }
+}
+
+use MailGuard\Scanner\Finding;
+use MailGuard\Scanner\Report;
+use MailGuard\Scanner\SinkScanner;
+
+$args = array_slice($argv, 1);
+$format = 'text';
+$exclude = ['vendor', 'node_modules', '.git', 'tests', 'test'];
+$paths = [];
+
+foreach ($args as $arg) {
+    if (str_starts_with($arg, '--format=')) {
+        $format = substr($arg, 9);
+    } elseif (str_starts_with($arg, '--exclude=')) {
+        $exclude = array_filter(explode(',', substr($arg, 10)), static fn(string $s): bool => $s !== '');
+    } elseif ($arg === '--help' || $arg === '-h') {
+        fwrite(STDOUT, <<<HELP
+        MailGuard mail-sink scanner
+
+        Usage: bin/scan [--format=text|json] [--exclude=a,b] <path...>
+
+        Finds native mail(), wp_mail(), PHPMailer/Swift/Symfony call sites,
+        header-injection patterns and sendmail argument-injection risks.
+        Exits 1 when CRITICAL findings exist (CI-friendly).
+
+        HELP);
+        exit(0);
+    } else {
+        $paths[] = $arg;
+    }
+}
+
+if ($paths === []) {
+    fwrite(STDERR, "Error: supply at least one file or directory to scan.\n");
+    exit(2);
+}
+
+$scanner = new SinkScanner($exclude);
+$findings = [];
+foreach ($paths as $path) {
+    if (!file_exists($path)) {
+        fwrite(STDERR, "Warning: path not found: {$path}\n");
+        continue;
+    }
+    $findings = array_merge($findings, $scanner->scan($path));
+}
+
+// De-duplicate (same file/line/sink).
+$seen = [];
+$findings = array_values(array_filter($findings, static function (Finding $f) use (&$seen): bool {
+    $key = $f->file . ':' . $f->line . ':' . $f->sink;
+    if (isset($seen[$key])) {
+        return false;
+    }
+    return $seen[$key] = true;
+}));
+
+echo match ($format) {
+    'json' => Report::json($findings),
+    default => Report::text($findings),
+};
+
+foreach ($findings as $f) {
+    if ($f->severity === Finding::SEVERITY_CRITICAL) {
+        exit(1);
+    }
+}
+exit(0);
